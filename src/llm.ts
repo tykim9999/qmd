@@ -587,10 +587,12 @@ export class LlamaCpp implements LLM {
   private async computeParallelism(perContextMB: number): Promise<number> {
     const llama = await this.ensureLlama();
 
-    // GPU: single context — multiple contexts risk VRAM fragmentation and
-    // synchronization issues with little measurable throughput gain.
+    // GPU: one context per device, capped by QMD_MAX_CONTEXTS
     if (llama.gpu) {
-      return 1;
+      const gpuDevices = await llama.getGpuDeviceNames();
+      const cap = parseInt(process.env.QMD_MAX_CONTEXTS || "0", 10);
+      const n = Math.max(1, gpuDevices.length);
+      return cap > 0 ? Math.min(n, cap) : n;
     }
 
     // CPU: split cores across contexts. At least 4 threads per context.
