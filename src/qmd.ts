@@ -69,6 +69,22 @@ import {
   DEFAULT_MULTI_GET_MAX_BYTES,
   createStore,
   getDefaultDbPath,
+  parseFrontmatter,
+  resolveRelatedId,
+  clearGraphForCollection,
+  insertGraphNode,
+  insertGraphEdge,
+  getGraphNode,
+  getGraphEdges,
+  traverseGraph,
+  traverseMultiHop,
+  graphImpact,
+  graphShortestPath,
+  getNodesByType,
+  getGraphStats,
+  type GraphNode,
+  type GraphEdge,
+  type GraphStats,
 } from "./store.js";
 import { disposeDefaultLlamaCpp, getDefaultLlamaCpp, withLLMSession, pullModels, DEFAULT_EMBED_MODEL_URI, DEFAULT_GENERATE_MODEL_URI, DEFAULT_RERANK_MODEL_URI, DEFAULT_MODEL_CACHE_DIR } from "./llm.js";
 import {
@@ -1526,6 +1542,51 @@ async function indexFiles(pwd?: string, globPattern: string = DEFAULT_GLOB, coll
   if (orphanedContent > 0) {
     console.log(`Cleaned up ${orphanedContent} orphaned content hash(es)`);
   }
+
+  // Phase 2: Build graph from frontmatter
+  clearGraphForCollection(db, collectionName);
+  const activeDocs = db.prepare(`
+    SELECT d.path, c.doc FROM documents d
+    JOIN content c ON d.hash = c.hash
+    WHERE d.collection = ? AND d.active = 1
+  `).all(collectionName) as { path: string; doc: string }[];
+
+  let graphNodes = 0, graphEdges = 0;
+  for (const row of activeDocs) {
+    const fm = parseFrontmatter(row.doc);
+    if (!fm || !fm.id) continue;
+    const id = fm.id as string;
+    const objectType = (fm.object_type || fm.type || null) as string | null;
+    const props: Record<string, unknown> = {};
+    for (const [k, v] of Object.entries(fm)) {
+      if (!["id", "related", "links", "object_type", "type"].includes(k)) {
+        props[k] = v;
+      }
+    }
+    insertGraphNode(db, id, objectType, props, collectionName, row.path);
+    graphNodes++;
+
+    // Untyped related links
+    if (Array.isArray(fm.related)) {
+      for (const rel of fm.related) {
+        const targetId = resolveRelatedId(rel as string);
+        insertGraphEdge(db, id, targetId, "related");
+        graphEdges++;
+      }
+    }
+
+    // Typed links
+    if (fm.links && typeof fm.links === "object") {
+      for (const [edgeType, targets] of Object.entries(fm.links as Record<string, unknown>)) {
+        const targetList = Array.isArray(targets) ? targets : [targets];
+        for (const t of targetList) {
+          insertGraphEdge(db, id, t as string, edgeType);
+          graphEdges++;
+        }
+      }
+    }
+  }
+  console.log(`Graph: ${graphNodes} nodes, ${graphEdges} edges`);
 
   if (needsEmbedding > 0 && !suppressEmbedNotice) {
     console.log(`\nRun 'qmd embed' to update embeddings (${needsEmbedding} unique hashes need vectors)`);

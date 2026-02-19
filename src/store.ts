@@ -13,6 +13,7 @@
 
 import { openDatabase, loadSqliteVec } from "./db.js";
 import type { Database } from "./db.js";
+import YAML from "yaml";
 import picomatch from "picomatch";
 import { createHash } from "crypto";
 import { realpathSync, statSync, mkdirSync } from "node:fs";
@@ -738,6 +739,31 @@ function initializeDatabase(db: Database): void {
       WHERE new.active = 1;
     END
   `);
+
+  // Graph tables - typed frontmatter relationships
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS graph_nodes (
+      id TEXT PRIMARY KEY,
+      object_type TEXT,
+      properties TEXT,
+      collection TEXT NOT NULL,
+      doc_path TEXT NOT NULL
+    )
+  `);
+  db.exec(`CREATE INDEX IF NOT EXISTS idx_graph_nodes_type ON graph_nodes(object_type)`);
+  db.exec(`CREATE INDEX IF NOT EXISTS idx_graph_nodes_collection ON graph_nodes(collection)`);
+
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS graph_edges (
+      source_id TEXT NOT NULL,
+      target_id TEXT NOT NULL,
+      edge_type TEXT NOT NULL,
+      PRIMARY KEY (source_id, target_id, edge_type)
+    )
+  `);
+  db.exec(`CREATE INDEX IF NOT EXISTS idx_graph_edges_source ON graph_edges(source_id)`);
+  db.exec(`CREATE INDEX IF NOT EXISTS idx_graph_edges_target ON graph_edges(target_id)`);
+  db.exec(`CREATE INDEX IF NOT EXISTS idx_graph_edges_type ON graph_edges(edge_type)`);
 }
 
 
@@ -760,6 +786,213 @@ function ensureVecTableInternal(db: Database, dimensions: number): void {
     db.exec("DROP TABLE IF EXISTS vectors_vec");
   }
   db.exec(`CREATE VIRTUAL TABLE vectors_vec USING vec0(hash_seq TEXT PRIMARY KEY, embedding float[${dimensions}] distance_metric=cosine)`);
+}
+
+// =============================================================================
+// Graph Types
+// =============================================================================
+
+export type GraphNode = {
+  id: string;
+  object_type: string | null;
+  properties: Record<string, unknown>;
+  collection: string;
+  doc_path: string;
+};
+
+export type GraphEdge = {
+  source_id: string;
+  target_id: string;
+  edge_type: string;
+};
+
+export type GraphStats = {
+  nodeCount: number;
+  edgeCount: number;
+  typeDistribution: Record<string, number>;
+};
+
+// =============================================================================
+// Graph: Frontmatter Parsing
+// =============================================================================
+
+export function parseFrontmatter(content: string): Record<string, unknown> | null {
+  const match = content.match(/^---\r?\n([\s\S]*?)\r?\n---/);
+  if (!match?.[1]) return null;
+  try {
+    const parsed = YAML.parse(match[1]);
+    return parsed && typeof parsed === "object" && !Array.isArray(parsed) ? parsed : null;
+  } catch {
+    return null;
+  }
+}
+
+export function resolveRelatedId(relatedPath: string): string {
+  return relatedPath.replace(/\.md$/, "").split("/").pop() || relatedPath;
+}
+
+// =============================================================================
+// Graph: Write Operations
+// =============================================================================
+
+export function clearGraphForCollection(db: Database, collection: string): void {
+  db.prepare(`
+    DELETE FROM graph_edges WHERE source_id IN (
+      SELECT id FROM graph_nodes WHERE collection = ?
+    )
+  `).run(collection);
+  db.prepare(`DELETE FROM graph_nodes WHERE collection = ?`).run(collection);
+}
+
+export function insertGraphNode(
+  db: Database,
+  id: string,
+  objectType: string | null,
+  properties: Record<string, unknown>,
+  collection: string,
+  docPath: string,
+): void {
+  db.prepare(`
+    INSERT OR REPLACE INTO graph_nodes (id, object_type, properties, collection, doc_path)
+    VALUES (?, ?, ?, ?, ?)
+  `).run(id, objectType, JSON.stringify(properties), collection, docPath);
+}
+
+export function insertGraphEdge(
+  db: Database,
+  sourceId: string,
+  targetId: string,
+  edgeType: string,
+): void {
+  db.prepare(`
+    INSERT OR IGNORE INTO graph_edges (source_id, target_id, edge_type)
+    VALUES (?, ?, ?)
+  `).run(sourceId, targetId, edgeType);
+}
+
+// =============================================================================
+// Graph: Query Operations
+// =============================================================================
+
+export function getGraphNode(db: Database, id: string): GraphNode | null {
+  const row = db.prepare(`SELECT * FROM graph_nodes WHERE id = ?`).get(id) as
+    { id: string; object_type: string | null; properties: string; collection: string; doc_path: string } | null;
+  if (!row) return null;
+  return { ...row, properties: JSON.parse(row.properties) };
+}
+
+export function getGraphEdges(db: Database, id: string): GraphEdge[] {
+  return db.prepare(`
+    SELECT * FROM graph_edges WHERE source_id = ? OR target_id = ?
+  `).all(id, id) as GraphEdge[];
+}
+
+export function traverseGraph(db: Database, id: string, edgeType: string): string[] {
+  const forward = db.prepare(`
+    SELECT target_id FROM graph_edges WHERE source_id = ? AND edge_type = ?
+  `).all(id, edgeType) as { target_id: string }[];
+  const reverse = db.prepare(`
+    SELECT source_id FROM graph_edges WHERE target_id = ? AND edge_type = ?
+  `).all(id, edgeType) as { source_id: string }[];
+
+  const ids = new Set<string>();
+  for (const r of forward) ids.add(r.target_id);
+  for (const r of reverse) ids.add(r.source_id);
+  ids.delete(id);
+  return [...ids];
+}
+
+export function traverseMultiHop(db: Database, startId: string, edgeTypes: string[]): string[] {
+  let current = [startId];
+  for (const edgeType of edgeTypes) {
+    const next = new Set<string>();
+    for (const id of current) {
+      for (const r of traverseGraph(db, id, edgeType)) next.add(r);
+    }
+    current = [...next];
+    if (current.length === 0) break;
+  }
+  return current;
+}
+
+export function graphImpact(
+  db: Database,
+  startId: string,
+  maxDepth: number,
+): { id: string; depth: number; edge_type: string }[] {
+  const visited = new Map<string, { depth: number; edge_type: string }>();
+  const queue: { id: string; depth: number }[] = [{ id: startId, depth: 0 }];
+
+  while (queue.length > 0) {
+    const current = queue.shift()!;
+    if (current.depth >= maxDepth) continue;
+
+    const edges = getGraphEdges(db, current.id);
+    for (const edge of edges) {
+      const neighborId = edge.source_id === current.id ? edge.target_id : edge.source_id;
+      if (!visited.has(neighborId) && neighborId !== startId) {
+        visited.set(neighborId, { depth: current.depth + 1, edge_type: edge.edge_type });
+        queue.push({ id: neighborId, depth: current.depth + 1 });
+      }
+    }
+  }
+
+  return [...visited.entries()].map(([id, info]) => ({
+    id,
+    depth: info.depth,
+    edge_type: info.edge_type,
+  }));
+}
+
+export function graphShortestPath(db: Database, fromId: string, toId: string): string[] {
+  if (fromId === toId) return [fromId];
+
+  const visited = new Set<string>([fromId]);
+  const parent = new Map<string, string>();
+  const queue: string[] = [fromId];
+
+  while (queue.length > 0) {
+    const current = queue.shift()!;
+    const edges = getGraphEdges(db, current);
+
+    for (const edge of edges) {
+      const neighborId = edge.source_id === current ? edge.target_id : edge.source_id;
+      if (!visited.has(neighborId)) {
+        visited.add(neighborId);
+        parent.set(neighborId, current);
+        if (neighborId === toId) {
+          const path: string[] = [toId];
+          let node = toId;
+          while (parent.has(node)) {
+            node = parent.get(node)!;
+            path.unshift(node);
+          }
+          return path;
+        }
+        queue.push(neighborId);
+      }
+    }
+  }
+
+  return [];
+}
+
+export function getNodesByType(db: Database, objectType: string): GraphNode[] {
+  const rows = db.prepare(`
+    SELECT * FROM graph_nodes WHERE object_type = ?
+  `).all(objectType) as { id: string; object_type: string; properties: string; collection: string; doc_path: string }[];
+  return rows.map(r => ({ ...r, properties: JSON.parse(r.properties) }));
+}
+
+export function getGraphStats(db: Database): GraphStats {
+  const nodeCount = (db.prepare(`SELECT COUNT(*) as c FROM graph_nodes`).get() as { c: number }).c;
+  const edgeCount = (db.prepare(`SELECT COUNT(*) as c FROM graph_edges`).get() as { c: number }).c;
+  const types = db.prepare(`SELECT object_type, COUNT(*) as c FROM graph_nodes GROUP BY object_type`).all() as { object_type: string; c: number }[];
+  const typeDistribution: Record<string, number> = {};
+  for (const t of types) {
+    typeDistribution[t.object_type || "(none)"] = t.c;
+  }
+  return { nodeCount, edgeCount, typeDistribution };
 }
 
 // =============================================================================
@@ -835,6 +1068,21 @@ export type Store = {
   getHashesForEmbedding: () => { hash: string; body: string; path: string }[];
   clearAllEmbeddings: () => void;
   insertEmbedding: (hash: string, seq: number, pos: number, embedding: Float32Array, model: string, embeddedAt: string) => void;
+
+  // Graph operations
+  parseFrontmatter: typeof parseFrontmatter;
+  resolveRelatedId: typeof resolveRelatedId;
+  clearGraphForCollection: (collection: string) => void;
+  insertGraphNode: (id: string, objectType: string | null, properties: Record<string, unknown>, collection: string, docPath: string) => void;
+  insertGraphEdge: (sourceId: string, targetId: string, edgeType: string) => void;
+  getGraphNode: (id: string) => GraphNode | null;
+  getGraphEdges: (id: string) => GraphEdge[];
+  traverseGraph: (id: string, edgeType: string) => string[];
+  traverseMultiHop: (startId: string, edgeTypes: string[]) => string[];
+  graphImpact: (startId: string, maxDepth: number) => { id: string; depth: number; edge_type: string }[];
+  graphShortestPath: (fromId: string, toId: string) => string[];
+  getNodesByType: (objectType: string) => GraphNode[];
+  getGraphStats: () => GraphStats;
 };
 
 /**
@@ -918,6 +1166,21 @@ export function createStore(dbPath?: string): Store {
     getHashesForEmbedding: () => getHashesForEmbedding(db),
     clearAllEmbeddings: () => clearAllEmbeddings(db),
     insertEmbedding: (hash: string, seq: number, pos: number, embedding: Float32Array, model: string, embeddedAt: string) => insertEmbedding(db, hash, seq, pos, embedding, model, embeddedAt),
+
+    // Graph operations
+    parseFrontmatter,
+    resolveRelatedId,
+    clearGraphForCollection: (collection: string) => clearGraphForCollection(db, collection),
+    insertGraphNode: (id, objectType, properties, collection, docPath) => insertGraphNode(db, id, objectType, properties, collection, docPath),
+    insertGraphEdge: (sourceId, targetId, edgeType) => insertGraphEdge(db, sourceId, targetId, edgeType),
+    getGraphNode: (id) => getGraphNode(db, id),
+    getGraphEdges: (id) => getGraphEdges(db, id),
+    traverseGraph: (id, edgeType) => traverseGraph(db, id, edgeType),
+    traverseMultiHop: (startId, edgeTypes) => traverseMultiHop(db, startId, edgeTypes),
+    graphImpact: (startId, maxDepth) => graphImpact(db, startId, maxDepth),
+    graphShortestPath: (fromId, toId) => graphShortestPath(db, fromId, toId),
+    getNodesByType: (objectType) => getNodesByType(db, objectType),
+    getGraphStats: () => getGraphStats(db),
   };
 }
 
