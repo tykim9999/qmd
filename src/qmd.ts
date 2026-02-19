@@ -336,6 +336,14 @@ async function showStatus(): Promise<void> {
     console.log(`  Updated:  ${formatTimeAgo(lastUpdate)}`);
   }
 
+  // Graph stats
+  const gStats = getGraphStats(db);
+  if (gStats.nodeCount > 0) {
+    console.log(`\n${c.bold}Graph${c.reset}`);
+    console.log(`  Nodes:    ${gStats.nodeCount}`);
+    console.log(`  Edges:    ${gStats.edgeCount}`);
+  }
+
   // Get all contexts grouped by collection (from YAML)
   const allContexts = listAllContexts();
   const contextsByCollection = new Map<string, { path_prefix: string; context: string }[]>();
@@ -2310,6 +2318,12 @@ function parseCLI() {
       from: { type: "string" },  // start line
       "max-bytes": { type: "string" },  // max bytes for multi-get
       "line-numbers": { type: "boolean" },  // add line numbers to output
+      // Graph options
+      impact: { type: "string" },
+      depth: { type: "string" },
+      path: { type: "string" },
+      type: { type: "string" },
+      edges: { type: "string" },
       // MCP HTTP transport options
       http: { type: "boolean" },
       daemon: { type: "boolean" },
@@ -2378,6 +2392,11 @@ function showHelp(): void {
   console.log("  qmd query 'lex:..\\nvec:...'   - Structured search (you provide lex/vec/hyde queries)");
   console.log("  qmd search <query>            - Full-text keyword search (BM25, no LLM)");
   console.log("  qmd vsearch <query>           - Vector similarity search (no reranking)");
+  console.log("  qmd graph [id[.edge_type...]] - Graph traversal (no args = stats)");
+  console.log("  qmd graph --impact <id> [--depth N]  - Fan-out impact analysis");
+  console.log("  qmd graph --path <from> <to>  - Shortest path between nodes");
+  console.log("  qmd graph --type <type>       - List nodes by object type");
+  console.log("  qmd graph --edges <id>        - Show all edges for a node");
   console.log("  qmd mcp                       - Start MCP server (stdio transport)");
   console.log("  qmd mcp --http [--port N]     - Start MCP server (HTTP transport, default port 8181)");
   console.log("  qmd mcp --http --daemon       - Start MCP server as background daemon");
@@ -2752,6 +2771,129 @@ if (fileURLToPath(import.meta.url) === process.argv[1] || process.argv[1]?.endsW
       break;
     }
 
+    case "graph": {
+      const db = getDb();
+
+      // --impact <id> [--depth N]
+      if (cli.values.impact) {
+        const id = cli.values.impact as string;
+        const depth = cli.values.depth ? parseInt(cli.values.depth as string, 10) : 2;
+        const results = graphImpact(db, id, depth);
+        if (results.length === 0) {
+          console.error(`No node found: ${id}`);
+          process.exit(1);
+        }
+        for (const r of results) {
+          console.log(`${r.id}\t${r.edge_type}\t${r.depth}`);
+        }
+        closeDb();
+        break;
+      }
+
+      // --path <from> <to>
+      if (cli.values.path) {
+        const fromId = cli.values.path as string;
+        const toId = cli.args[0];
+        if (!toId) {
+          console.error("Usage: qmd graph --path <from> <to>");
+          process.exit(1);
+        }
+        const path = graphShortestPath(db, fromId, toId);
+        if (path.length === 0) {
+          console.error(`No path found: ${fromId} -> ${toId}`);
+          process.exit(1);
+        }
+        for (const id of path) {
+          console.log(id);
+        }
+        closeDb();
+        break;
+      }
+
+      // --type <type>
+      if (cli.values.type) {
+        const nodes = getNodesByType(db, cli.values.type as string);
+        for (const n of nodes) {
+          console.log(n.id);
+        }
+        closeDb();
+        break;
+      }
+
+      // --edges <id>
+      if (cli.values.edges) {
+        const edges = getGraphEdges(db, cli.values.edges as string);
+        if (edges.length === 0) {
+          console.error(`No edges for: ${cli.values.edges}`);
+          process.exit(1);
+        }
+        for (const e of edges) {
+          console.log(`${e.source_id}\t${e.edge_type}\t${e.target_id}`);
+        }
+        closeDb();
+        break;
+      }
+
+      // Positional: id or id.edgeType.edgeType...
+      const expr = cli.args[0];
+      if (!expr) {
+        // No args: show graph stats
+        const stats = getGraphStats(db);
+        console.log(`Nodes: ${stats.nodeCount}`);
+        console.log(`Edges: ${stats.edgeCount}`);
+        if (Object.keys(stats.typeDistribution).length > 0) {
+          console.log(`\nTypes:`);
+          for (const [t, count] of Object.entries(stats.typeDistribution)) {
+            console.log(`  ${t}: ${count}`);
+          }
+        }
+        closeDb();
+        break;
+      }
+
+      const parts = expr.split(".");
+      const startId = parts[0]!;
+
+      if (parts.length === 1) {
+        // Show node info + edges
+        const node = getGraphNode(db, startId);
+        if (!node) {
+          console.error(`Node not found: ${startId}`);
+          process.exit(1);
+        }
+        console.log(`id: ${node.id}`);
+        if (node.object_type) console.log(`type: ${node.object_type}`);
+        console.log(`collection: ${node.collection}`);
+        console.log(`path: ${node.doc_path}`);
+        const props = node.properties;
+        if (Object.keys(props).length > 0) {
+          for (const [k, v] of Object.entries(props)) {
+            const val = Array.isArray(v) ? v.join(", ") : String(v);
+            console.log(`${k}: ${val}`);
+          }
+        }
+        const edges = getGraphEdges(db, startId);
+        if (edges.length > 0) {
+          console.log(`\nEdges:`);
+          for (const e of edges) {
+            const dir = e.source_id === startId ? "->" : "<-";
+            const other = e.source_id === startId ? e.target_id : e.source_id;
+            console.log(`  ${dir} ${e.edge_type} ${other}`);
+          }
+        }
+      } else {
+        // Dot notation traversal
+        const edgeTypes = parts.slice(1);
+        const results = traverseMultiHop(db, startId, edgeTypes);
+        for (const id of results) {
+          console.log(id);
+        }
+      }
+
+      closeDb();
+      break;
+    }
+
     case "cleanup": {
       const db = getDb();
 
@@ -2773,7 +2915,15 @@ if (fileURLToPath(import.meta.url) === process.argv[1] || process.argv[1]?.endsW
         console.log(`${c.green}✓${c.reset} Removed ${inactiveDocs} inactive document records`);
       }
 
-      // 4. Vacuum to reclaim space
+      // 4. Clear graph tables
+      const graphBefore = getGraphStats(db);
+      if (graphBefore.nodeCount > 0) {
+        db.exec(`DELETE FROM graph_edges`);
+        db.exec(`DELETE FROM graph_nodes`);
+        console.log(`${c.green}✓${c.reset} Cleared graph (${graphBefore.nodeCount} nodes, ${graphBefore.edgeCount} edges)`);
+      }
+
+      // 5. Vacuum to reclaim space
       vacuumDatabase(db);
       console.log(`${c.green}✓${c.reset} Database vacuumed`);
 
