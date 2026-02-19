@@ -3,9 +3,9 @@ import type { Database } from "./db.js";
 import fastGlob from "fast-glob";
 import { execSync, spawn as nodeSpawn } from "child_process";
 import { fileURLToPath } from "url";
-import { dirname, join as pathJoin } from "path";
+import { dirname } from "path";
 import { parseArgs } from "util";
-import { readFileSync, statSync, existsSync, unlinkSync, writeFileSync, openSync, closeSync, mkdirSync } from "fs";
+import { readFileSync, statSync } from "fs";
 import {
   getPwd,
   getRealPath,
@@ -308,21 +308,6 @@ async function showStatus(): Promise<void> {
   console.log(`Index: ${dbPath}`);
   console.log(`Size:  ${formatBytes(indexSize)}`);
 
-  // MCP daemon status (check PID file liveness)
-  const mcpCacheDir = process.env.XDG_CACHE_HOME
-    ? resolve(process.env.XDG_CACHE_HOME, "qmd")
-    : resolve(homedir(), ".cache", "qmd");
-  const mcpPidPath = resolve(mcpCacheDir, "mcp.pid");
-  if (existsSync(mcpPidPath)) {
-    const mcpPid = parseInt(readFileSync(mcpPidPath, "utf-8").trim());
-    try {
-      process.kill(mcpPid, 0);
-      console.log(`MCP:   ${c.green}running${c.reset} (PID ${mcpPid})`);
-    } catch {
-      unlinkSync(mcpPidPath);
-      // Stale PID file cleaned up silently
-    }
-  }
   console.log("");
 
   console.log(`${c.bold}Documents${c.reset}`);
@@ -2324,10 +2309,6 @@ function parseCLI() {
       path: { type: "string" },
       type: { type: "string" },
       edges: { type: "string" },
-      // MCP HTTP transport options
-      http: { type: "boolean" },
-      daemon: { type: "boolean" },
-      port: { type: "string" },
     },
     allowPositionals: true,
     strict: false, // Allow unknown options to pass through
@@ -2397,10 +2378,6 @@ function showHelp(): void {
   console.log("  qmd graph --path <from> <to>  - Shortest path between nodes");
   console.log("  qmd graph --type <type>       - List nodes by object type");
   console.log("  qmd graph --edges <id>        - Show all edges for a node");
-  console.log("  qmd mcp                       - Start MCP server (stdio transport)");
-  console.log("  qmd mcp --http [--port N]     - Start MCP server (HTTP transport, default port 8181)");
-  console.log("  qmd mcp --http --daemon       - Start MCP server as background daemon");
-  console.log("  qmd mcp stop                  - Stop background MCP daemon");
   console.log("");
   console.log("Global options:");
   console.log("  --index <name>             - Use custom index name (default: index)");
@@ -2685,92 +2662,6 @@ if (fileURLToPath(import.meta.url) === process.argv[1] || process.argv[1]?.endsW
       await querySearch(cli.query, cli.opts);
       break;
 
-    case "mcp": {
-      const sub = cli.args[0]; // stop | status | undefined
-
-      // Cache dir for PID/log files — same dir as the index
-      const cacheDir = process.env.XDG_CACHE_HOME
-        ? resolve(process.env.XDG_CACHE_HOME, "qmd")
-        : resolve(homedir(), ".cache", "qmd");
-      const pidPath = resolve(cacheDir, "mcp.pid");
-
-      // Subcommands take priority over flags
-      if (sub === "stop") {
-        if (!existsSync(pidPath)) {
-          console.log("Not running (no PID file).");
-          process.exit(0);
-        }
-        const pid = parseInt(readFileSync(pidPath, "utf-8").trim());
-        try {
-          process.kill(pid, 0); // alive?
-          process.kill(pid, "SIGTERM");
-          unlinkSync(pidPath);
-          console.log(`Stopped QMD MCP server (PID ${pid}).`);
-        } catch {
-          unlinkSync(pidPath);
-          console.log("Cleaned up stale PID file (server was not running).");
-        }
-        process.exit(0);
-      }
-
-      if (cli.values.http) {
-        const port = Number(cli.values.port) || 8181;
-
-        if (cli.values.daemon) {
-          // Guard: check if already running
-          if (existsSync(pidPath)) {
-            const existingPid = parseInt(readFileSync(pidPath, "utf-8").trim());
-            try {
-              process.kill(existingPid, 0); // alive?
-              console.error(`Already running (PID ${existingPid}). Run 'qmd mcp stop' first.`);
-              process.exit(1);
-            } catch {
-              // Stale PID file — continue
-            }
-          }
-
-          mkdirSync(cacheDir, { recursive: true });
-          const logPath = resolve(cacheDir, "mcp.log");
-          const logFd = openSync(logPath, "w"); // truncate — fresh log per daemon run
-          const selfPath = fileURLToPath(import.meta.url);
-          const spawnArgs = selfPath.endsWith(".ts")
-            ? ["--import", pathJoin(dirname(selfPath), "..", "node_modules", "tsx", "dist", "esm", "index.mjs"), selfPath, "mcp", "--http", "--port", String(port)]
-            : [selfPath, "mcp", "--http", "--port", String(port)];
-          const child = nodeSpawn(process.execPath, spawnArgs, {
-            stdio: ["ignore", logFd, logFd],
-            detached: true,
-          });
-          child.unref();
-          closeSync(logFd); // parent's copy; child inherited the fd
-
-          writeFileSync(pidPath, String(child.pid));
-          console.log(`Started on http://localhost:${port}/mcp (PID ${child.pid})`);
-          console.log(`Logs: ${logPath}`);
-          process.exit(0);
-        }
-
-        // Foreground HTTP mode — remove top-level cursor handlers so the
-        // async cleanup handlers in startMcpHttpServer actually run.
-        process.removeAllListeners("SIGTERM");
-        process.removeAllListeners("SIGINT");
-        const { startMcpHttpServer } = await import("./mcp.js");
-        try {
-          await startMcpHttpServer(port);
-        } catch (e: any) {
-          if (e?.code === "EADDRINUSE") {
-            console.error(`Port ${port} already in use. Try a different port with --port.`);
-            process.exit(1);
-          }
-          throw e;
-        }
-      } else {
-        // Default: stdio transport
-        const { startMcpServer } = await import("./mcp.js");
-        await startMcpServer();
-      }
-      break;
-    }
-
     case "graph": {
       const db = getDb();
 
@@ -2937,9 +2828,7 @@ if (fileURLToPath(import.meta.url) === process.argv[1] || process.argv[1]?.endsW
       process.exit(1);
   }
 
-  if (cli.command !== "mcp") {
-    await disposeDefaultLlamaCpp();
-    process.exit(0);
-  }
+  await disposeDefaultLlamaCpp();
+  process.exit(0);
 
 } // end if (main module)
