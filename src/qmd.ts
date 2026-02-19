@@ -86,7 +86,13 @@ import {
   type GraphEdge,
   type GraphStats,
 } from "./store.js";
-import { disposeDefaultLlamaCpp, getDefaultLlamaCpp, withLLMSession, pullModels, DEFAULT_EMBED_MODEL_URI, DEFAULT_GENERATE_MODEL_URI, DEFAULT_RERANK_MODEL_URI, DEFAULT_MODEL_CACHE_DIR } from "./llm.js";
+// Lazy-loaded: import("./llm.js") only when LLM features are needed
+type LLMModule = typeof import("./llm.js");
+let _llm: LLMModule | null = null;
+async function llm(): Promise<LLMModule> {
+  if (!_llm) _llm = await import("./llm.js");
+  return _llm;
+}
 import {
   formatSearchResults,
   formatDocuments,
@@ -385,9 +391,9 @@ async function showStatus(): Promise<void> {
     console.log(`\n${c.dim}No collections. Run 'qmd collection add .' to index markdown files.${c.reset}`);
   }
 
-  // Models
-  {
-    // hf:org/repo/file.gguf → https://huggingface.co/org/repo
+  // Models + Device (lazy-load llm)
+  try {
+    const { DEFAULT_EMBED_MODEL_URI, DEFAULT_GENERATE_MODEL_URI, DEFAULT_RERANK_MODEL_URI, getDefaultLlamaCpp } = await llm();
     const hfLink = (uri: string) => {
       const match = uri.match(/^hf:([^/]+\/[^/]+)\//);
       return match ? `https://huggingface.co/${match[1]}` : uri;
@@ -396,12 +402,9 @@ async function showStatus(): Promise<void> {
     console.log(`  Embedding:   ${hfLink(DEFAULT_EMBED_MODEL_URI)}`);
     console.log(`  Reranking:   ${hfLink(DEFAULT_RERANK_MODEL_URI)}`);
     console.log(`  Generation:  ${hfLink(DEFAULT_GENERATE_MODEL_URI)}`);
-  }
 
-  // Device / GPU info
-  try {
-    const llm = getDefaultLlamaCpp();
-    const device = await llm.getDeviceInfo();
+    const llamaCpp = getDefaultLlamaCpp();
+    const device = await llamaCpp.getDeviceInfo();
     console.log(`\n${c.bold}Device${c.reset}`);
     if (device.gpu) {
       console.log(`  GPU:      ${c.green}${device.gpu}${c.reset} (offloading: ${device.gpuOffloading ? 'yes' : 'no'})`);
@@ -1667,6 +1670,7 @@ async function vectorIndex(model: string = DEFAULT_EMBED_MODEL, force: boolean =
 
   // Wrap all LLM embedding operations in a session for lifecycle management
   // Use 30 minute timeout for large collections
+  const { withLLMSession } = await llm();
   await withLLMSession(async (session) => {
     // Get embedding dimensions from first chunk
     progress.indeterminate();
@@ -2116,7 +2120,8 @@ async function vectorSearch(query: string, opts: OutputOptions, _model: string =
 
   checkIndexHealth(store.db);
 
-  await withLLMSession(async () => {
+  const { withLLMSession: withSession } = await llm();
+  await withSession(async () => {
     let results = await vectorSearchQuery(store, query, {
       collection: singleCollection,
       limit: opts.all ? 500 : (opts.limit || 10),
@@ -2172,7 +2177,8 @@ async function querySearch(query: string, opts: OutputOptions, _embedModel: stri
   // Check for structured query syntax (lex:/vec:/hyde: prefixes)
   const structuredQueries = parseStructuredQuery(query);
 
-  await withLLMSession(async () => {
+  const { withLLMSession: withSession2 } = await llm();
+  await withSession2(async () => {
     let results;
 
     if (structuredQueries) {
@@ -2613,6 +2619,7 @@ if (fileURLToPath(import.meta.url) === process.argv[1] || process.argv[1]?.endsW
       break;
 
     case "pull": {
+      const { pullModels, DEFAULT_EMBED_MODEL_URI, DEFAULT_GENERATE_MODEL_URI, DEFAULT_RERANK_MODEL_URI, DEFAULT_MODEL_CACHE_DIR } = await llm();
       const refresh = cli.values.refresh === undefined ? false : Boolean(cli.values.refresh);
       const models = [
         DEFAULT_EMBED_MODEL_URI,
@@ -2828,7 +2835,7 @@ if (fileURLToPath(import.meta.url) === process.argv[1] || process.argv[1]?.endsW
       process.exit(1);
   }
 
-  await disposeDefaultLlamaCpp();
+  if (_llm) await _llm.disposeDefaultLlamaCpp();
   process.exit(0);
 
 } // end if (main module)
