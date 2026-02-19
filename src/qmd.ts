@@ -2413,6 +2413,17 @@ function showHelp(): void {
   console.log("  --max-bytes <num>          - Skip files larger than N bytes (default: 10240)");
   console.log("  --json/--csv/--md/--xml/--files - Output format (same as search)");
   console.log("");
+  console.log("Graph examples:");
+  console.log("  qmd graph                          - Show node/edge counts and type distribution");
+  console.log("  qmd graph my-note                  - Show node properties and all edges");
+  console.log("  qmd graph my-note.related           - One-hop traversal (pipe-friendly, one ID per line)");
+  console.log("  qmd graph a.related.related          - Multi-hop dot notation");
+  console.log("  qmd graph --impact my-note --depth 3 - What's affected? (BFS fan-out)");
+  console.log("  qmd graph --path note-a note-b       - Shortest path between two nodes");
+  console.log("");
+  console.log("  Graph nodes are built from YAML frontmatter (id, type, related, links).");
+  console.log("  Run 'qmd update' to rebuild the graph after editing notes.");
+  console.log("");
   console.log(`Index: ${getDbPath()}`);
 }
 
