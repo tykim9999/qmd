@@ -2835,7 +2835,7 @@ if (fileURLToPath(import.meta.url) === process.argv[1] || process.argv[1]?.endsW
       process.exit(1);
   }
 
-  if (_llm) await _llm.disposeDefaultLlamaCpp();
+  if (_llm) await (_llm as LLMModule).disposeDefaultLlamaCpp();
   process.exit(0);
 
 } // end if (main module)

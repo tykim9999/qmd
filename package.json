@@ -12,6 +12,7 @@
     "LICENSE"
   ],
   "scripts": {
+    "build": "tsc -p tsconfig.build.json",
     "test": "bun test test/",
     "qmd": "bun src/qmd.ts"
   },

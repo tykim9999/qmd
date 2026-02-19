@@ -11,4 +11,12 @@ while [[ -L "$SOURCE" ]]; do
 done
 SCRIPT_DIR="$(cd -P "$(dirname "$SOURCE")" && pwd)"
 
-exec bun "$SCRIPT_DIR/src/qmd.ts" "$@"
+# Commands needing sqlite-vec (vector search) must run under Node
+# because bun:sqlite cannot load native extensions.
+# All other commands run under Bun for faster startup.
+case "${1:-}" in
+  query|vsearch|embed|pull|status)
+    exec node "$SCRIPT_DIR/dist/qmd.js" "$@" ;;
+  *)
+    exec bun "$SCRIPT_DIR/src/qmd.ts" "$@" ;;
+esac
