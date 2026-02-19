@@ -7,22 +7,16 @@
     "qmd": "qmd"
   },
   "files": [
-    "dist/",
+    "src/",
     "qmd",
     "LICENSE",
     "CHANGELOG.md"
   ],
   "scripts": {
     "prepare": "[ -d .git ] && ./scripts/install-hooks.sh || true",
-    "build": "tsc -p tsconfig.build.json",
-    "test": "vitest run --reporter=verbose test/",
-    "qmd": "tsx src/qmd.ts",
-    "index": "tsx src/qmd.ts index",
-    "vector": "tsx src/qmd.ts vector",
-    "search": "tsx src/qmd.ts search",
-    "vsearch": "tsx src/qmd.ts vsearch",
-    "rerank": "tsx src/qmd.ts rerank",
-    "inspector": "npx @modelcontextprotocol/inspector tsx src/qmd.ts mcp",
+    "test": "bun test test/",
+    "qmd": "bun src/qmd.ts",
+    "inspector": "npx @modelcontextprotocol/inspector bun src/qmd.ts mcp",
     "release": "./scripts/release.sh"
   },
   "publishConfig": {
@@ -53,15 +47,7 @@
     "sqlite-vec-win32-x64": "^0.1.7-alpha.2"
   },
   "devDependencies": {
-    "@types/better-sqlite3": "^7.6.0",
-    "tsx": "^4.0.0",
-    "vitest": "^3.0.0"
-  },
-  "peerDependencies": {
-    "typescript": "^5.9.3"
-  },
-  "engines": {
-    "node": ">=22.0.0"
+    "@types/better-sqlite3": "^7.6.0"
   },
   "keywords": [
     "markdown",
